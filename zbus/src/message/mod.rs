@@ -191,15 +191,18 @@ impl Message {
             .error_name(name)
     }
 
-    /// Create a message from bytes.
-    ///
-    /// **Note:** Since the message is not constructed by zbus, the receive sequence,
-    /// which can be acquired from [`Message::recv_position`], is not applicable and hence set
-    /// to `0`.
+    /// Create a message from bytes, like [`Message::try_from_bytes`], but without checking that the
+    /// bytes end where the header says, or that they carry no more file descriptors than the header
+    /// counts.
     ///
     /// # Safety
     ///
-    /// This method is unsafe as bytes may have an invalid encoding.
+    /// The caller has nothing to uphold: nothing in this method is unsafe.
+    #[deprecated(
+        since = "6.6.0",
+        note = "Nothing in it is unsafe: use Message::try_from_bytes. This will be removed in \
+                zbus 7."
+    )]
     pub unsafe fn from_bytes(bytes: serialized::Data<'static, 'static>) -> Result<Self> {
         Self::from_raw_parts(bytes, 0)
     }
