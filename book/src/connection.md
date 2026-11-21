@@ -86,6 +86,8 @@ of `zbus` has only the part of the API that this needs:
 * [`Message::take_from`] takes a message out of the bytes that came in once it is whole, along
   with its file descriptors.
 * A message goes out as the bytes and the file descriptors of [`Message::data`].
+* [`connection::handshake::Command`] parses and writes the commands of the authentication handshake,
+  which comes before the messages.
 
 ```rust,noplayground
 # #[cfg(unix)]
@@ -193,5 +195,6 @@ has how to write one.
 [`PrimaryHeader::read_with_len`]: https://docs.rs/zbus/latest/zbus/message/struct.PrimaryHeader.html#method.read_with_len
 [`Message::take_from`]: https://docs.rs/zbus/latest/zbus/message/struct.Message.html#method.take_from
 [`Message::data`]: https://docs.rs/zbus/latest/zbus/message/struct.Message.html#method.data
+[`connection::handshake::Command`]: https://docs.rs/zbus/latest/zbus/connection/handshake/enum.Command.html
 
 [^bus-less]: Unless you implemented them, none of the bus methods will exist.
