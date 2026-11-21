@@ -369,7 +369,7 @@ impl Message {
     /// received.
     ///
     /// Validate the message in place so errors leave both buffers unchanged.
-    fn take_received(
+    pub(crate) fn take_received(
         bytes: &mut Vec<u8>,
         #[cfg(unix)] fds: &mut Vec<OwnedFd>,
         recv_seq: u64,
