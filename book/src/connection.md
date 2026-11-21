@@ -113,6 +113,9 @@ while let Some(call) = Message::take_from(&mut bytes, &mut fds)? {
 # fn main() {}
 ```
 
+The [`own_io`] fixture of the zbus repository is a complete server built this way. In its test, a
+zbus connection talks to it as to a bus.
+
 ## Runtimes
 
 A connection takes its readiness notifications, timers, spawned tasks and blocking work from one
@@ -200,5 +203,6 @@ has how to write one.
 [`connection::handshake::Command`]: https://docs.rs/zbus/latest/zbus/connection/handshake/enum.Command.html
 [`ConnectionCredentials::from_socket`]: https://docs.rs/zbus/latest/zbus/fdo/struct.ConnectionCredentials.html#method.from_socket
 [`Guid::generate`]: https://docs.rs/zbus/latest/zbus/struct.Guid.html#method.generate
+[`own_io`]: https://github.com/z-galaxy/zbus/tree/main/test_fixtures/own_io
 
 [^bus-less]: Unless you implemented them, none of the bus methods will exist.
