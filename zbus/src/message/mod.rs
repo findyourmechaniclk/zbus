@@ -1,11 +1,16 @@
 //! D-Bus Message.
-use std::{fmt, num::NonZeroU32, ops::Range, sync::Arc};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+use std::{fmt, mem, num::NonZeroU32, ops::Range, sync::Arc};
 
 use crate::{
     Error, ObjectPath, Result,
     names::{BusName, ErrorName, InterfaceName, MemberName},
     utils::padding_for_8_bytes,
-    wire::{Endian, serialized},
+    wire::{
+        Endian,
+        serialized::{self, Context},
+    },
 };
 
 mod builder;
@@ -21,10 +26,10 @@ mod body;
 pub use body::Body;
 
 pub(crate) mod header;
-use header::PROTOCOL_VERSION;
 pub use header::{EndianSig, Flags, Header, NATIVE_ENDIAN_SIG, PrimaryHeader, Type};
 #[cfg(feature = "bus-impl")]
 use header::{MAX_MESSAGE_SIZE, PRIMARY_HEADER_SIZE};
+use header::{MIN_MESSAGE_SIZE, PROTOCOL_VERSION};
 
 pub(crate) mod parser;
 use parser::QuickFields;
@@ -199,6 +204,79 @@ impl Message {
         Self::from_raw_parts(bytes, 0)
     }
 
+    /// Take the first message out of `bytes` once it is whole, and its file descriptors out of
+    /// `fds`.
+    ///
+    /// A program that reads messages off its own socket uses this to turn what it reads into
+    /// messages. `bytes` holds the bytes that came in and are not taken yet, and `fds` the file
+    /// descriptors that came with them, in the order that they came in. Each call takes one
+    /// message once `bytes` holds all of it. Until then, it returns `None` and takes nothing.
+    /// [`PrimaryHeader::read_with_len`] tells the length of a message.
+    ///
+    /// The message takes as many file descriptors from the start of `fds` as its header counts,
+    /// whichever of its bytes they came with, as the reference implementation of D-Bus does. The
+    /// D-Bus specification has them sent with the bytes of the message, none before its first byte
+    /// or after its last, so they have all come in once the message has. The others stay in `fds`
+    /// for the messages after it.
+    ///
+    /// The message is checked as a connection checks the messages that it receives: its whole
+    /// header, its protocol version, the fields that its type requires, and the padding after the
+    /// header. The body is not checked against its signature: [`Body::validate`] does that.
+    ///
+    /// The message keeps the allocation of `bytes`, and the bytes after it are copied to a new
+    /// one. So nothing is copied if the program reads no further than the end of the message that
+    /// it waits for.
+    ///
+    /// The message is at receive position 0 ([`Message::recv_position`]), as no connection
+    /// received it.
+    ///
+    /// The method takes `fds` on Unix only, where messages carry file descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the message fails these checks, with the error that tells what is wrong with it.
+    /// Errors in its first 16 bytes, which [`PrimaryHeader::read_with_len`] reports, come as soon
+    /// as these bytes are in, before the rest of the message. Fails with
+    /// [`Error::MissingParameter`] if the header counts more file descriptors than `fds` holds. On
+    /// an error, nothing is taken out of `bytes` or `fds`.
+    ///
+    /// # Example
+    ///
+    /// Two messages come in, the second one in two parts.
+    ///
+    /// ```
+    /// use zbus::message::Message;
+    ///
+    /// let ping = Message::method_call("/org/zbus/Example", "Ping").build(&())?;
+    /// let pong = Message::method_call("/org/zbus/Example", "Pong").build(&())?;
+    /// let mut bytes = ping.data().to_vec();
+    /// bytes.extend_from_slice(&pong.data()[..20]);
+    /// #[cfg(unix)]
+    /// let mut fds = vec![];
+    ///
+    /// let msg = Message::take_from(&mut bytes, #[cfg(unix)] &mut fds)?.unwrap();
+    /// assert_eq!(msg.header().member().unwrap().as_str(), "Ping");
+    ///
+    /// // The first part of the second message waits for the rest.
+    /// assert!(Message::take_from(&mut bytes, #[cfg(unix)] &mut fds)?.is_none());
+    /// bytes.extend_from_slice(&pong.data()[20..]);
+    /// let msg = Message::take_from(&mut bytes, #[cfg(unix)] &mut fds)?.unwrap();
+    /// assert_eq!(msg.header().member().unwrap().as_str(), "Pong");
+    /// assert!(bytes.is_empty());
+    /// # Ok::<(), zbus::Error>(())
+    /// ```
+    pub fn take_from(
+        bytes: &mut Vec<u8>,
+        #[cfg(unix)] fds: &mut Vec<OwnedFd>,
+    ) -> Result<Option<Self>> {
+        Self::take_received(
+            bytes,
+            #[cfg(unix)]
+            fds,
+            0,
+        )
+    }
+
     /// Create a message from its full contents.
     pub(crate) fn from_raw_parts(
         bytes: serialized::Data<'static, 'static>,
@@ -214,6 +292,8 @@ impl Message {
             &primary_header,
             &quick_fields,
             &bytes,
+            #[cfg(unix)]
+            bytes.fds().len(),
             header_len..body_offset,
         )?;
         let quick_fields = quick_fields.into();
@@ -227,6 +307,57 @@ impl Message {
                 recv_seq: Sequence { recv_seq },
             }),
         })
+    }
+
+    /// [`Message::take_from`], for a message at position `recv_seq` among those that a connection
+    /// received.
+    ///
+    /// Validate the message in place so errors leave both buffers unchanged.
+    fn take_received(
+        bytes: &mut Vec<u8>,
+        #[cfg(unix)] fds: &mut Vec<OwnedFd>,
+        recv_seq: u64,
+    ) -> Result<Option<Self>> {
+        if bytes.len() < MIN_MESSAGE_SIZE {
+            return Ok(None);
+        }
+        let (_, len) = PrimaryHeader::read_with_len(bytes)?;
+        let Some(msg) = bytes.get(..len) else {
+            return Ok(None);
+        };
+        let (primary_header, header_len, quick_fields) = parser::parse(msg)?;
+        let body_offset = header_len + padding_for_8_bytes(header_len);
+        check_whole(
+            &primary_header,
+            &quick_fields,
+            msg,
+            #[cfg(unix)]
+            fds.len(),
+            header_len..body_offset,
+        )?;
+
+        // Nothing is allocated when nothing follows the message.
+        let rest = bytes.split_off(len);
+        let bytes = mem::replace(bytes, rest);
+        let ctxt = Context::new(primary_header.endian_sig().into(), 0);
+        #[cfg(unix)]
+        let bytes = {
+            let count = quick_fields.unix_fds().unwrap_or(0) as usize;
+
+            serialized::Data::new_fds(bytes, ctxt, fds.drain(..count))
+        };
+        #[cfg(not(unix))]
+        let bytes = serialized::Data::new(bytes, ctxt);
+
+        Ok(Some(Self {
+            inner: Arc::new(Inner {
+                primary_header,
+                quick_fields: quick_fields.into(),
+                bytes,
+                body_offset,
+                recv_seq: Sequence { recv_seq },
+            }),
+        }))
     }
 
     /// The message, at position `recv_seq` of those that a connection received.
@@ -452,15 +583,16 @@ impl Message {
 
 /// Check what makes the message in `bytes` whole, beyond each field of its header, which parsing
 /// the header checks: its protocol version, the fields that its type requires, the padding between
-/// its header and its body, at `padding`, which must be 0, and, on Unix, that it brought as many
-/// file descriptors as its header says.
+/// its header and its body, at `padding`, which must be 0, and, on Unix, that the `fds` file
+/// descriptors that came with it are at least as many as its header counts.
 ///
 /// Only a received message is checked so: one that zbus builds may lack a field that the
 /// specification requires, if it was built so.
 fn check_whole(
     primary_header: &PrimaryHeader,
     quick_fields: &QuickFields,
-    bytes: &serialized::Data<'static, 'static>,
+    bytes: &[u8],
+    #[cfg(unix)] fds: usize,
     padding: Range<usize>,
 ) -> Result<()> {
     if primary_header.protocol_version() != PROTOCOL_VERSION {
@@ -474,7 +606,7 @@ fn check_whole(
         return Err(Error::PaddingNot0(*byte));
     }
     #[cfg(unix)]
-    if bytes.fds().len() < quick_fields.unix_fds().unwrap_or(0) as usize {
+    if fds < quick_fields.unix_fds().unwrap_or(0) as usize {
         return Err(Error::MissingParameter("Missing file descriptors"));
     }
 
@@ -571,10 +703,10 @@ mod tests {
     use crate::Signature;
     use std::num::NonZeroU32;
     #[cfg(unix)]
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use test_log::test;
 
-    use super::{Message, Type, parser};
+    use super::{Message, Sequence, Type, parser};
     use crate::{Error, wire::serialized::Data};
 
     #[test]
@@ -865,5 +997,136 @@ mod tests {
         let data = Data::new_fds(bytes, m.data().context(), fds);
         let error = Message::from_raw_parts(data, 0).unwrap_err();
         assert!(matches!(error, Error::MissingParameter(_)), "{error:?}");
+    }
+
+    /// Each message is taken out of the bytes that came in once all of it is there, and nothing
+    /// is taken before that.
+    #[test]
+    fn take_from() {
+        let msgs = [1u32, 2].map(|n| Message::method_call("/", "Test").build(&n).unwrap());
+        let mut bytes = [&msgs[0].data()[..], &msgs[1].data()[..]].concat();
+        #[cfg(unix)]
+        let mut fds = vec![];
+
+        // Too few bytes for a primary header, and for the whole message.
+        for len in [0, 10, msgs[0].data().len() - 1] {
+            let mut part = bytes[..len].to_vec();
+
+            let taken = Message::take_from(
+                &mut part,
+                #[cfg(unix)]
+                &mut fds,
+            );
+
+            assert!(taken.unwrap().is_none(), "{len} bytes");
+            assert_eq!(part, &bytes[..len]);
+        }
+
+        // Two whole messages, back to back.
+        for sent in &msgs {
+            let taken = Message::take_from(
+                &mut bytes,
+                #[cfg(unix)]
+                &mut fds,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(taken.data().bytes(), sent.data().bytes());
+            assert_eq!(
+                taken.header().primary().serial_num(),
+                sent.primary_header().serial_num()
+            );
+            assert_eq!(taken.recv_position(), Sequence::default());
+        }
+        assert!(bytes.is_empty());
+    }
+
+    /// Each message takes as many of the first file descriptors that came in as its header counts,
+    /// and leaves the others for the messages after it.
+    #[cfg(unix)]
+    #[test]
+    fn take_from_with_fds() {
+        let stdout = std::io::stdout();
+        let (first, second, third): (Fd<'_>, Fd<'_>, Fd<'_>) =
+            ((&stdout).into(), (&stdout).into(), (&stdout).into());
+        let msgs = [
+            Message::method_call("/", "Two")
+                .build(&(first, second))
+                .unwrap(),
+            Message::method_call("/", "None").build(&()).unwrap(),
+            Message::method_call("/", "One").build(&third).unwrap(),
+        ];
+        let mut bytes = msgs
+            .iter()
+            .flat_map(|msg| msg.data().bytes())
+            .copied()
+            .collect();
+        // The descriptors that came in with the bytes, and one more that came in ahead of the
+        // message that takes it.
+        let mut fds: Vec<OwnedFd> = (0..4).map(|_| std::io::pipe().unwrap().0.into()).collect();
+        let raw: Vec<_> = fds.iter().map(AsRawFd::as_raw_fd).collect();
+
+        for expected in [&raw[..2], &[], &raw[2..3]] {
+            let taken = Message::take_from(&mut bytes, &mut fds).unwrap().unwrap();
+
+            let taken: Vec<_> = taken
+                .data()
+                .fds()
+                .iter()
+                .map(|fd| fd.as_fd().as_raw_fd())
+                .collect();
+            assert_eq!(taken, expected);
+        }
+        assert!(bytes.is_empty());
+        assert_eq!(
+            fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+            &raw[3..]
+        );
+    }
+
+    /// A message whose header counts more file descriptors than came in is an error, and nothing
+    /// is taken out of the bytes or the file descriptors.
+    #[cfg(unix)]
+    #[test]
+    fn take_from_with_too_few_fds() {
+        let stdout = std::io::stdout();
+        let (first, second): (Fd<'_>, Fd<'_>) = ((&stdout).into(), (&stdout).into());
+        let msg = Message::method_call("/", "Two")
+            .build(&(first, second))
+            .unwrap();
+        let mut bytes = msg.data().to_vec();
+        let mut fds: Vec<OwnedFd> = vec![std::io::pipe().unwrap().0.into()];
+
+        let error = Message::take_from(&mut bytes, &mut fds).unwrap_err();
+
+        assert!(matches!(error, Error::MissingParameter(_)), "{error:?}");
+        assert_eq!(bytes, msg.data().bytes());
+        assert_eq!(fds.len(), 1);
+    }
+
+    /// Bytes that don't start with a valid message are an error, and nothing is taken out of them.
+    #[test]
+    fn take_from_invalid() {
+        let msg = Message::method_call("/", "Test").build(&()).unwrap();
+        // An unknown endian signature, and a protocol version that doesn't exist.
+        for (at, byte, expected) in [
+            (0, b'x', Error::IncorrectEndian),
+            (3, 2, Error::InvalidField),
+        ] {
+            let mut bytes = msg.data().to_vec();
+            bytes[at] = byte;
+            let sent = bytes.clone();
+
+            let error = Message::take_from(
+                &mut bytes,
+                #[cfg(unix)]
+                &mut vec![],
+            )
+            .unwrap_err();
+
+            assert_eq!(error, expected);
+            assert_eq!(bytes, sent);
+        }
     }
 }

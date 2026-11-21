@@ -75,6 +75,40 @@ up on. A stream of another kind is handed over as the socket it wraps: `into_std
 **Note:** the `p2p` and `server` methods of `connection::Builder` are only available when `p2p`
 cargo feature of `zbus` is enabled.
 
+## Doing the I/O yourself
+
+A program with its own event loop, such as a bus, can read and write D-Bus messages on its sockets
+itself, without a zbus connection, and so without a zbus runtime either. The `core` cargo feature
+of `zbus` has only the part of the API that this needs:
+
+* [`PrimaryHeader::read_with_len`] gives the length of a message from its first 16 bytes, so that
+  the program can read up to its end.
+* [`Message::take_from`] takes a message out of the bytes that came in once it is whole, along
+  with its file descriptors.
+* A message goes out as the bytes and the file descriptors of [`Message::data`].
+
+```rust,noplayground
+# #[cfg(unix)]
+# fn main() -> zbus::Result<()> {
+use zbus::message::Message;
+
+// The bytes and the file descriptors that came in on a socket, not taken as messages yet: here, a
+// call.
+let mut bytes = Message::method_call("/org/zbus/Example", "Ping").build(&())?.data().to_vec();
+let mut fds = vec![];
+
+while let Some(call) = Message::take_from(&mut bytes, &mut fds)? {
+    let reply = Message::method_return(&call.header()).build(&())?;
+    // What goes out on the socket: the bytes of `reply.data()`, and its `fds()` along with them.
+#   let _ = reply;
+}
+# Ok(())
+# }
+#
+# #[cfg(not(unix))]
+# fn main() {}
+```
+
 ## Runtimes
 
 A connection takes its readiness notifications, timers, spawned tasks and blocking work from one
@@ -156,5 +190,8 @@ has how to write one.
 [`Builder::socket`]: https://docs.rs/zbus/latest/zbus/connection/struct.Builder.html#method.socket
 [`Builder::authenticated_socket`]: https://docs.rs/zbus/latest/zbus/connection/struct.Builder.html#method.authenticated_socket
 [`Socket`]: https://docs.rs/zbus/latest/zbus/connection/socket/trait.Socket.html
+[`PrimaryHeader::read_with_len`]: https://docs.rs/zbus/latest/zbus/message/struct.PrimaryHeader.html#method.read_with_len
+[`Message::take_from`]: https://docs.rs/zbus/latest/zbus/message/struct.Message.html#method.take_from
+[`Message::data`]: https://docs.rs/zbus/latest/zbus/message/struct.Message.html#method.data
 
 [^bus-less]: Unless you implemented them, none of the bus methods will exist.

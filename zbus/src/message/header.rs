@@ -177,8 +177,11 @@ impl PrimaryHeader {
     ///
     /// A program that reads messages off its own socket uses this to find where each message
     /// ends. The first 16 bytes of a message hold its primary header and the length of its header
-    /// fields. Once they are in, this gives the length of the message. The header fields and the
-    /// body are not read.
+    /// fields. Once they are in, this gives the length of the message, and [`Message::take_from`]
+    /// takes the message once all of its bytes are in. The header fields and the body are not
+    /// read.
+    ///
+    /// [`Message::take_from`]: super::Message::take_from
     ///
     /// # Errors
     ///
